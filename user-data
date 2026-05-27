@@ -1,0 +1,1317 @@
+#cloud-config
+autoinstall:
+  version: 1
+
+  reporting:
+    builtin:
+      type: print
+
+  source:
+    id: ubuntu-server-minimal
+
+  locale: en_US.UTF-8
+
+  keyboard:
+    layout: us
+
+  identity:
+    hostname: backup01
+    username: redacted
+    # Generate with: mkpasswd --method=SHA-512
+    password: "CHANGE_ME_PASSWORD_HASH"
+
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      - "CHANGE_ME_SSH_PUBLIC_KEY"
+
+  storage:
+    layout:
+      name: zfs
+
+  packages:
+    - openssh-server
+    - ufw
+    - fail2ban
+    - syncthing
+    - restic
+    - sanoid
+    - zfsutils-linux
+
+  user-data:
+    timezone: America/Chicago
+    package_update: true
+
+    # Explicitly define the main operator user.
+    #
+    # The autoinstall identity block creates the login user. This cloud-init
+    # user block keeps the user intent visible and ensures sudo access is
+    # explicit in the resulting system.
+    users:
+      - default
+      - name: redacted
+        groups: [sudo]
+        shell: /bin/bash
+        sudo: ALL=(ALL) NOPASSWD:ALL
+
+    write_files:
+      # SSH hardening.
+      #
+      # Password logins and root SSH are disabled. Access is intended to be
+      # key-only via the public key in the autoinstall ssh.authorized-keys
+      # section above.
+      - path: /etc/ssh/sshd_config.d/99-hardening.conf
+        permissions: "0644"
+        content: |
+          PermitRootLogin no
+          PasswordAuthentication no
+          PubkeyAuthentication yes
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          X11Forwarding no
+          MaxAuthTries 3
+          ClientAliveInterval 300
+          ClientAliveCountMax 2
+
+      # Basic fail2ban SSH jail.
+      - path: /etc/fail2ban/jail.local
+        permissions: "0644"
+        content: |
+          [sshd]
+          enabled = true
+          port = ssh
+          maxretry = 5
+          bantime = 1h
+          findtime = 10m
+
+      # Sanoid policy for the Syncthing ZFS dataset.
+      #
+      # This snapshots rpool/sync, which is mounted at /srv/syncthing.
+      # Syncthing-managed content is expected under /srv/syncthing/sync.
+      - path: /etc/sanoid/sanoid.conf
+        permissions: "0644"
+        content: |
+          [rpool/sync]
+            use_template = syncthing
+            recursive = yes
+
+          [template_syncthing]
+            frequently = 4
+            hourly = 24
+            daily = 14
+            monthly = 3
+            autosnap = yes
+            autoprune = yes
+
+      # Local Restic repository.
+      #
+      # This repository is useful for fast local restores and validation.
+      # Local Restic pruning is enabled in restic-backup-local.
+      - path: /etc/restic/local.env
+        permissions: "0600"
+        content: |
+          export RESTIC_REPOSITORY=/srv/restic
+          export RESTIC_PASSWORD=CHANGE_ME_RESTIC_PASSWORD
+
+      # Backblaze B2 Restic repository.
+      #
+      # This is intentionally configured separately from the local repository.
+      # B2 is not enabled automatically. Replace the CHANGE_ME values, verify
+      # the B2 bucket has Object Lock configured as desired, then run:
+      #
+      #   sudo enable-restic-b2
+      - path: /etc/restic/b2.env
+        permissions: "0600"
+        content: |
+          export RESTIC_REPOSITORY=b2:CHANGE_ME_B2_BUCKET:backup01
+          export RESTIC_PASSWORD=CHANGE_ME_RESTIC_PASSWORD
+          export B2_ACCOUNT_ID=CHANGE_ME_B2_ACCOUNT_ID
+          export B2_ACCOUNT_KEY=CHANGE_ME_B2_ACCOUNT_KEY
+
+      # Human-readable B2 Object Lock policy note installed on the system.
+      #
+      # Object Lock is a bucket-side feature. This VM cannot safely guarantee
+      # immutability unless the B2 bucket itself was created and configured
+      # with Object Lock and default retention.
+      - path: /etc/restic/b2-object-lock-policy.txt
+        permissions: "0600"
+        content: |
+          Backblaze B2 Object Lock policy for SyncVault.
+
+          Required manual B2 bucket settings:
+          - Bucket must be private.
+          - Object Lock must be enabled at bucket creation time.
+          - Default bucket retention should be enabled.
+          - Suggested initial default retention: 30 days.
+          - Application key should be scoped to this bucket only.
+
+          Important:
+          - Restic encrypts data before upload.
+          - Object Lock is controlled by Backblaze bucket settings, not this VM.
+          - The B2 backup job is intentionally append-oriented.
+          - The B2 backup job does not run restic forget --prune.
+          - Keep local Restic pruning enabled.
+          - Test Object Lock behavior before relying on it for production immutability.
+
+      # Local Restic backup.
+      #
+      # Local backups use normal Restic retention and pruning because this repo
+      # is not object-locked and lives on the dedicated rpool/restic dataset.
+      - path: /usr/local/sbin/restic-backup-local
+        permissions: "0755"
+        content: |
+          #!/bin/sh
+          set -eu
+          . /etc/restic/local.env
+
+          restic backup /home /etc /srv/syncthing
+
+          restic forget \
+            --keep-daily 14 \
+            --keep-weekly 8 \
+            --keep-monthly 6 \
+            --prune
+
+      # Backblaze B2 Restic backup.
+      #
+      # This remote repository is intentionally append-oriented.
+      # Do not run restic forget --prune against an object-locked bucket until
+      # retention/prune behavior has been explicitly tested. Object Lock can
+      # prevent deletion of old pack/index/lock files during the retention
+      # window.
+      - path: /usr/local/sbin/restic-backup-b2
+        permissions: "0755"
+        content: |
+          #!/bin/sh
+          set -eu
+          . /etc/restic/b2.env
+
+          restic backup /home /etc /srv/syncthing
+
+          # Object Lock note:
+          # This remote repository is intentionally append-oriented.
+          # Do not run `restic forget --prune` against an object-locked
+          # bucket until retention/prune behavior has been explicitly tested.
+          # Object Lock can prevent deletion of old pack/index/lock files
+          # during the retention window.
+
+      - path: /etc/systemd/system/restic-backup-local.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Restic Backup - Local Repository
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/restic-backup-local
+
+      - path: /etc/systemd/system/restic-backup-local.timer
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Daily Restic Backup - Local Repository
+
+          [Timer]
+          OnCalendar=03:30
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+
+      - path: /etc/systemd/system/restic-backup-b2.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Restic Backup - Backblaze B2 Repository
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/restic-backup-b2
+
+      - path: /etc/systemd/system/restic-backup-b2.timer
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Daily Restic Backup - Backblaze B2 Repository
+
+          [Timer]
+          OnCalendar=04:30
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+
+      # Prevent Syncthing from creating its default "Sync" folder.
+      #
+      # The intended folder root is /srv/syncthing/sync, which lives on the
+      # dedicated rpool/sync dataset.
+      - path: /etc/systemd/system/syncthing@redacted.service.d/override.conf
+        permissions: "0644"
+        content: |
+          [Service]
+          Environment=STNODEFAULTFOLDER=1
+
+      # Enable B2 after credentials and bucket policy are configured.
+      - path: /usr/local/sbin/enable-restic-b2
+        permissions: "0755"
+        content: |
+          #!/bin/sh
+          set -eu
+
+          if grep -q 'CHANGE_ME' /etc/restic/b2.env; then
+            echo "ERROR: /etc/restic/b2.env still contains CHANGE_ME placeholders."
+            exit 1
+          fi
+
+          . /etc/restic/b2.env
+
+          if restic snapshots >/dev/null 2>&1; then
+            echo "Backblaze B2 Restic repo already initialized."
+          else
+            restic init
+          fi
+
+          systemctl daemon-reload
+          systemctl enable --now restic-backup-b2.timer
+          echo "Backblaze B2 Restic timer enabled."
+
+      # Validate the local SyncVault stack.
+      #
+      # This validator creates an explicit ZFS validation snapshot rather than
+      # relying on Sanoid timing. It then backs up locally with Restic, restores
+      # the latest snapshot, verifies the test file, and runs restic check.
+      - path: /usr/local/sbin/validate-syncvault
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          SYNC_DATASET="rpool/sync"
+          RESTIC_DATASET="rpool/restic"
+          SYNC_ROOT="/srv/syncthing"
+          SYNC_FOLDER="/srv/syncthing/sync"
+          RESTORE_DIR="/tmp/restic-local-restore-validation"
+          TEST_FILE="restic-validation-$(date +%Y%m%d-%H%M%S).txt"
+          TEST_SNAPSHOT="validation-$(date +%Y%m%d-%H%M%S)"
+
+          echo "== SyncVault local validation starting =="
+
+          echo "== 1. Check ZFS datasets =="
+          zfs list "$SYNC_DATASET"
+          zfs list "$RESTIC_DATASET"
+
+          echo "== 2. Check mountpoints =="
+          df -h "$SYNC_ROOT"
+          df -h /srv/restic
+
+          echo "== 3. Check Syncthing folder =="
+          mkdir -p "$SYNC_FOLDER"
+          ls -ld "$SYNC_ROOT" "$SYNC_FOLDER"
+
+          echo "== 4. Write test file into Syncthing folder =="
+          echo "restic validation $(date -Is)" > "$SYNC_FOLDER/$TEST_FILE"
+          cat "$SYNC_FOLDER/$TEST_FILE"
+
+          echo "== 5. Take explicit validation snapshot =="
+          zfs snapshot "$SYNC_DATASET@$TEST_SNAPSHOT"
+          zfs list -t snapshot "$SYNC_DATASET@$TEST_SNAPSHOT"
+
+          echo "== 6. Verify file is visible in explicit ZFS snapshot =="
+          SNAPSHOT_FILE="$SYNC_ROOT/.zfs/snapshot/$TEST_SNAPSHOT/sync/$TEST_FILE"
+          cat "$SNAPSHOT_FILE"
+
+          echo "== 7. Run local Restic backup =="
+          systemctl start restic-backup-local.service
+          systemctl status restic-backup-local.service --no-pager || true
+
+          echo "== 8. List local Restic snapshots =="
+          . /etc/restic/local.env
+          restic snapshots
+
+          echo "== 9. Restore latest local Restic snapshot =="
+          rm -rf "$RESTORE_DIR"
+          mkdir -p "$RESTORE_DIR"
+          restic restore latest --target "$RESTORE_DIR"
+
+          echo "== 10. Verify restored test file =="
+          RESTORED_FILE="$RESTORE_DIR$SYNC_FOLDER/$TEST_FILE"
+          cat "$RESTORED_FILE"
+
+          echo "== 11. Local Restic repository integrity check =="
+          restic check
+
+          echo "== LOCAL VALIDATION PASSED =="
+
+      # Validate Backblaze B2 in lightweight mode.
+      #
+      # This validator is intended for routine use. It verifies B2 repository
+      # access, performs an append-oriented B2 backup, lists snapshots, runs
+      # restic check, and restores only a small include path instead of the
+      # entire repository.
+      #
+      # This avoids exhausting provider-side daily download caps during normal
+      # validation.
+      #
+      # For a full disaster-recovery restore drill, use:
+      #
+      #   sudo validate-restic-b2-full
+      - path: /usr/local/sbin/validate-restic-b2
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          RESTORE_DIR="/tmp/restic-b2-fast-restore-validation"
+          SENTINEL_DIR="/srv/syncthing/sync"
+          SENTINEL_FILE="b2-validation-sentinel.txt"
+          SENTINEL_PATH="$SENTINEL_DIR/$SENTINEL_FILE"
+
+          if grep -q 'CHANGE_ME' /etc/restic/b2.env; then
+            echo "FAIL: /etc/restic/b2.env still contains CHANGE_ME placeholders."
+            exit 1
+          fi
+
+          . /etc/restic/b2.env
+
+          echo "== 1. Create/update small B2 validation sentinel =="
+          mkdir -p "$SENTINEL_DIR"
+          echo "b2 validation $(date -Is)" > "$SENTINEL_PATH"
+          cat "$SENTINEL_PATH"
+
+          echo "== 2. Check or initialize B2 repository =="
+          if restic snapshots >/dev/null 2>&1; then
+            echo "PASS: B2 repository is reachable."
+          else
+            echo "No usable B2 repository found; initializing."
+            restic init
+          fi
+
+          echo "== 3. Run append-oriented B2 backup =="
+          /usr/local/sbin/restic-backup-b2
+
+          echo "== 4. List B2 snapshots =="
+          restic snapshots
+
+          echo "== 5. Restore only the small validation sentinel from latest B2 snapshot =="
+          rm -rf "$RESTORE_DIR"
+          mkdir -p "$RESTORE_DIR"
+
+          restic restore latest \
+            --target "$RESTORE_DIR" \
+            --include "$SENTINEL_PATH"
+
+          RESTORED_FILE="$RESTORE_DIR$SENTINEL_PATH"
+
+          echo "== 6. Verify restored sentinel =="
+          cat "$RESTORED_FILE"
+
+          echo "== 7. Check B2 repository metadata/integrity =="
+          restic check
+
+          echo "== B2 FAST VALIDATION PASSED =="
+
+      # Full Backblaze B2 disaster-recovery restore drill.
+      #
+      # This intentionally restores the full latest B2 snapshot. It can be
+      # slow, bandwidth-heavy, and may hit provider-side download caps. Use it
+      # manually for periodic DR drills, not as a frequent scheduled health
+      # check.
+      - path: /usr/local/sbin/validate-restic-b2-full
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          RESTORE_DIR="/tmp/restic-b2-full-restore-validation"
+
+          if grep -q 'CHANGE_ME' /etc/restic/b2.env; then
+            echo "FAIL: /etc/restic/b2.env still contains CHANGE_ME placeholders."
+            exit 1
+          fi
+
+          . /etc/restic/b2.env
+
+          echo "== 1. Check or initialize B2 repository =="
+          if restic snapshots >/dev/null 2>&1; then
+            echo "PASS: B2 repository is reachable."
+          else
+            echo "No usable B2 repository found; initializing."
+            restic init
+          fi
+
+          echo "== 2. Run append-oriented B2 backup =="
+          /usr/local/sbin/restic-backup-b2
+
+          echo "== 3. List B2 snapshots =="
+          restic snapshots
+
+          echo "== 4. Restore full latest B2 snapshot =="
+          rm -rf "$RESTORE_DIR"
+          mkdir -p "$RESTORE_DIR"
+
+          restic restore latest --target "$RESTORE_DIR"
+
+          echo "== 5. Check B2 repository integrity =="
+          restic check
+
+          echo "== B2 FULL VALIDATION PASSED =="
+
+
+      # ZFS scrub service for rpool.
+      #
+      # Scrubs verify ZFS checksums across stored blocks and help detect
+      # latent corruption before it becomes a restore-time surprise. On
+      # redundant pools, ZFS can repair bad copies automatically. On a
+      # single-disk VM, scrubs still provide early corruption detection and
+      # exercise the storage stack.
+      - path: /etc/systemd/system/zfs-scrub-rpool.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=ZFS Scrub - rpool
+          Documentation=man:zpool(8)
+          ConditionPathIsDirectory=/sys/module/zfs
+
+          [Service]
+          Type=oneshot
+          ExecStart=/sbin/zpool scrub rpool
+
+      - path: /etc/systemd/system/zfs-scrub-rpool.timer
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Monthly ZFS Scrub - rpool
+
+          [Timer]
+          OnCalendar=monthly
+          Persistent=true
+          RandomizedDelaySec=6h
+
+          [Install]
+          WantedBy=timers.target
+
+      # ZFS scrub service for bpool.
+      #
+      # Ubuntu ZFS root installs typically create a separate boot pool named
+      # bpool. Scrubbing bpool is cheap and helps detect boot-pool corruption.
+      - path: /etc/systemd/system/zfs-scrub-bpool.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=ZFS Scrub - bpool
+          Documentation=man:zpool(8)
+          ConditionPathIsDirectory=/sys/module/zfs
+
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/sh -c 'zpool list bpool >/dev/null 2>&1 && /sbin/zpool scrub bpool || true'
+
+      - path: /etc/systemd/system/zfs-scrub-bpool.timer
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Monthly ZFS Scrub - bpool
+
+          [Timer]
+          OnCalendar=monthly
+          Persistent=true
+          RandomizedDelaySec=6h
+
+          [Install]
+          WantedBy=timers.target
+
+      # Validate ZFS scrub timer configuration and current pool health.
+      #
+      # This validator does not start a scrub by default. Scrubs can be IO
+      # intensive, so this checks scheduling and pool status safely. To start
+      # a scrub manually, run:
+      #
+      #   sudo zpool scrub rpool
+      #   sudo zpool scrub bpool
+      - path: /usr/local/sbin/validate-zfs-scrubs
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          FAIL=0
+
+          pass() { echo "PASS: $*"; }
+          warn() { echo "WARN: $*"; }
+          fail() { echo "FAIL: $*"; FAIL=1; }
+
+          echo "== ZFS scrub validation =="
+
+          echo "== 1. Check pools =="
+          zpool list rpool
+          if zpool list bpool >/dev/null 2>&1; then
+            zpool list bpool
+            HAVE_BPOOL=1
+          else
+            warn "bpool not found; skipping bpool-specific checks"
+            HAVE_BPOOL=0
+          fi
+
+          echo "== 2. Check scrub timers =="
+          if systemctl is-enabled --quiet zfs-scrub-rpool.timer; then
+            pass "zfs-scrub-rpool.timer is enabled"
+          else
+            fail "zfs-scrub-rpool.timer is not enabled"
+          fi
+
+          if systemctl is-active --quiet zfs-scrub-rpool.timer; then
+            pass "zfs-scrub-rpool.timer is active"
+          else
+            fail "zfs-scrub-rpool.timer is not active"
+          fi
+
+          if [ "$HAVE_BPOOL" -eq 1 ]; then
+            if systemctl is-enabled --quiet zfs-scrub-bpool.timer; then
+              pass "zfs-scrub-bpool.timer is enabled"
+            else
+              fail "zfs-scrub-bpool.timer is not enabled"
+            fi
+
+            if systemctl is-active --quiet zfs-scrub-bpool.timer; then
+              pass "zfs-scrub-bpool.timer is active"
+            else
+              fail "zfs-scrub-bpool.timer is not active"
+            fi
+          fi
+
+          echo "== 3. Show timer schedule =="
+          systemctl list-timers 'zfs-scrub-*' --no-pager || true
+
+          echo "== 4. Check pool health =="
+          zpool status rpool
+          if zpool status rpool | grep -q "state: ONLINE"; then
+            pass "rpool is ONLINE"
+          else
+            fail "rpool is not ONLINE"
+          fi
+
+          if [ "$HAVE_BPOOL" -eq 1 ]; then
+            zpool status bpool
+            if zpool status bpool | grep -q "state: ONLINE"; then
+              pass "bpool is ONLINE"
+            else
+              fail "bpool is not ONLINE"
+            fi
+          fi
+
+          echo "== 5. Show last scrub/scan status =="
+          zpool status rpool | grep -E "scan:|scrub" || true
+          if [ "$HAVE_BPOOL" -eq 1 ]; then
+            zpool status bpool | grep -E "scan:|scrub" || true
+          fi
+
+          if [ "$FAIL" -eq 0 ]; then
+            echo "ZFS SCRUB VALIDATION PASSED"
+            exit 0
+          else
+            echo "ZFS SCRUB VALIDATION FAILED"
+            exit 1
+          fi
+
+      # Validate network security posture.
+      #
+      # This checks effective sshd settings, UFW policy, Fail2ban status,
+      # Syncthing GUI exposure, and listening ports.
+      - path: /usr/local/sbin/validate-network-security
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          FAIL=0
+
+          pass() { echo "PASS: $*"; }
+          warn() { echo "WARN: $*"; }
+          fail() { echo "FAIL: $*"; FAIL=1; }
+          section() { echo; echo "== $* =="; }
+
+          require_cmd() {
+            command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1"
+          }
+
+          section "Basic command availability"
+          for cmd in sshd ufw fail2ban-client ss systemctl awk grep sed; do
+            require_cmd "$cmd"
+          done
+
+          section "SSH effective configuration"
+          SSHD_CONFIG="$(sshd -T 2>/dev/null || true)"
+
+          check_sshd_value() {
+            local key="$1"
+            local expected="$2"
+            local actual
+            actual="$(printf '%s\n' "$SSHD_CONFIG" | awk -v k="$key" '$1 == k {print $2; exit}')"
+
+            if [ -z "$actual" ]; then
+              fail "sshd option '$key' not found"
+            elif [ "$actual" = "$expected" ]; then
+              pass "sshd $key = $actual"
+            else
+              fail "sshd $key = $actual, expected $expected"
+            fi
+          }
+
+          check_sshd_value "permitrootlogin" "no"
+          check_sshd_value "passwordauthentication" "no"
+          check_sshd_value "pubkeyauthentication" "yes"
+          check_sshd_value "kbdinteractiveauthentication" "no"
+          check_sshd_value "x11forwarding" "no"
+
+          MAX_AUTH_TRIES="$(printf '%s\n' "$SSHD_CONFIG" | awk '$1 == "maxauthtries" {print $2; exit}')"
+          if [ -n "$MAX_AUTH_TRIES" ] && [ "$MAX_AUTH_TRIES" -le 3 ]; then
+            pass "sshd maxauthtries = $MAX_AUTH_TRIES"
+          else
+            warn "sshd maxauthtries = ${MAX_AUTH_TRIES:-unset}; recommended <= 3"
+          fi
+
+          section "SSH service state"
+          if systemctl is-active --quiet ssh || systemctl is-active --quiet sshd; then
+            pass "ssh/sshd service is active"
+          else
+            fail "ssh/sshd service is not active"
+          fi
+
+          if systemctl is-enabled --quiet ssh || systemctl is-enabled --quiet sshd; then
+            pass "ssh/sshd service is enabled"
+          else
+            warn "ssh/sshd service is not enabled as a named unit; socket activation may still be active"
+          fi
+
+          section "UFW status"
+          ufw status | grep -q "Status: active" && pass "UFW is active" || fail "UFW is not active"
+
+          UFW_VERBOSE="$(ufw status verbose || true)"
+          echo "$UFW_VERBOSE"
+
+          printf '%s\n' "$UFW_VERBOSE" | grep -qi "Default: deny (incoming)" && pass "UFW default incoming policy is deny" || fail "UFW default incoming policy is not deny"
+          printf '%s\n' "$UFW_VERBOSE" | grep -qi "allow (outgoing)" && pass "UFW default outgoing policy is allow" || warn "UFW default outgoing policy is not clearly allow"
+
+          if ufw status | grep -qi "OpenSSH"; then
+            pass "UFW allows OpenSSH"
+          elif ufw status numbered | grep -q "22/tcp"; then
+            pass "UFW allows 22/tcp"
+          else
+            fail "UFW missing OpenSSH/22-tcp rule"
+          fi
+
+          for rule in "22000/tcp" "22000/udp" "21027/udp"; do
+            ufw status numbered | grep -q "$rule" && pass "UFW allows $rule" || fail "UFW missing expected rule: $rule"
+          done
+
+          section "Fail2ban service and sshd jail"
+          systemctl is-active --quiet fail2ban && pass "fail2ban service is active" || fail "fail2ban service is not active"
+          systemctl is-enabled --quiet fail2ban && pass "fail2ban service is enabled" || fail "fail2ban service is not enabled"
+
+          fail2ban-client status | grep -q "sshd" && pass "fail2ban sshd jail exists" || fail "fail2ban sshd jail not found"
+
+          if fail2ban-client status sshd >/dev/null 2>&1; then
+            pass "fail2ban sshd jail is queryable"
+            fail2ban-client status sshd
+          else
+            fail "fail2ban sshd jail is not queryable"
+          fi
+
+          section "Syncthing GUI exposure"
+          SYNCTHING_8384="$(ss -tlnp | grep ':8384' || true)"
+
+          if [ -z "$SYNCTHING_8384" ]; then
+            warn "No Syncthing GUI listener found on 8384"
+          else
+            echo "$SYNCTHING_8384"
+            printf '%s\n' "$SYNCTHING_8384" | grep -q "127.0.0.1:8384" && pass "Syncthing GUI is bound to localhost IPv4" || fail "Syncthing GUI may not be bound to localhost IPv4"
+
+            if printf '%s\n' "$SYNCTHING_8384" | grep -q "0.0.0.0:8384"; then
+              fail "Syncthing GUI is exposed on all IPv4 interfaces"
+            fi
+
+            if printf '%s\n' "$SYNCTHING_8384" | grep -q "\\[::\\]:8384"; then
+              fail "Syncthing GUI is exposed on all IPv6 interfaces"
+            fi
+          fi
+
+          section "Listening TCP ports"
+          ss -tlnp
+
+          section "Listening UDP ports"
+          ss -ulnp
+
+          section "Summary"
+          if [ "$FAIL" -eq 0 ]; then
+            echo "NETWORK SECURITY VALIDATION PASSED"
+            exit 0
+          else
+            echo "NETWORK SECURITY VALIDATION FAILED"
+            exit 1
+          fi
+
+
+      # Local Restic repository health check.
+      #
+      # This check is intentionally lighter than a full read-data check.
+      # It verifies repository metadata and structure on a schedule so that
+      # backup repository problems are surfaced before restore time.
+      - path: /usr/local/sbin/check-restic-local
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          . /etc/restic/local.env
+
+          echo "== Local Restic repository check =="
+          restic snapshots
+          restic check
+
+      - path: /etc/systemd/system/check-restic-local.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Check Local Restic Repository
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/check-restic-local
+
+      - path: /etc/systemd/system/check-restic-local.timer
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Weekly Local Restic Repository Check
+
+          [Timer]
+          OnCalendar=weekly
+          Persistent=true
+          RandomizedDelaySec=2h
+
+          [Install]
+          WantedBy=timers.target
+
+      # ZFS pool health check.
+      #
+      # This is intended to catch degraded pools, checksum errors, read/write
+      # errors, and other states that should not wait for a manual login.
+      - path: /usr/local/sbin/check-zfs-health
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          FAIL=0
+
+          check_pool() {
+            pool="$1"
+
+            if ! zpool list "$pool" >/dev/null 2>&1; then
+              echo "WARN: pool not found: $pool"
+              return 0
+            fi
+
+            echo "== zpool status $pool =="
+            zpool status "$pool"
+
+            state="$(zpool list -H -o health "$pool")"
+            if [ "$state" != "ONLINE" ]; then
+              echo "FAIL: $pool health is $state"
+              FAIL=1
+            else
+              echo "PASS: $pool health is ONLINE"
+            fi
+
+            if zpool status "$pool" | grep -Eqi 'errors: No known data errors'; then
+              echo "PASS: $pool reports no known data errors"
+            else
+              echo "FAIL: $pool may report data errors"
+              FAIL=1
+            fi
+          }
+
+          check_pool rpool
+          check_pool bpool
+
+          if [ "$FAIL" -eq 0 ]; then
+            echo "ZFS HEALTH CHECK PASSED"
+            exit 0
+          else
+            echo "ZFS HEALTH CHECK FAILED"
+            exit 1
+          fi
+
+      - path: /etc/systemd/system/check-zfs-health.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Check ZFS Pool Health
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/check-zfs-health
+
+      - path: /etc/systemd/system/check-zfs-health.timer
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Daily ZFS Pool Health Check
+
+          [Timer]
+          OnCalendar=daily
+          Persistent=true
+          RandomizedDelaySec=1h
+
+          [Install]
+          WantedBy=timers.target
+
+      # Sanoid snapshot freshness check.
+      #
+      # This verifies that snapshots exist and are fresh for rpool/sync.
+      #
+      # v1.0 behavior:
+      # - Prefer Sanoid autosnap snapshots when present.
+      # - Accept validation-* snapshots on a brand-new install before Sanoid
+      #   has had time to create its first autosnap.
+      # - Fail if no snapshots exist at all.
+      # - Fail if the newest acceptable snapshot is older than the freshness
+      #   threshold.
+      #
+      # The default threshold is 26 hours so that a daily snapshot cadence has
+      # room for timer jitter, reboots, and randomized delays.
+      - path: /usr/local/sbin/check-sanoid-freshness
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          DATASET="rpool/sync"
+          MAX_AGE_HOURS="${MAX_AGE_HOURS:-26}"
+
+          echo "== Sanoid snapshot freshness check =="
+          echo "Dataset: $DATASET"
+          echo "Maximum expected age: $MAX_AGE_HOURS hours"
+
+          if ! zfs list "$DATASET" >/dev/null 2>&1; then
+            echo "FAIL: dataset not found: $DATASET"
+            exit 1
+          fi
+
+          snapshot_rows="$(zfs list -H -t snapshot -o name,creation -s creation -r "$DATASET" 2>/dev/null || true)"
+
+          if [ -z "$snapshot_rows" ]; then
+            echo "FAIL: no snapshots found for $DATASET"
+            exit 1
+          fi
+
+          echo "Known snapshots:"
+          printf '%s\n' "$snapshot_rows" | awk '{print "  " $1}'
+
+          # Prefer real Sanoid autosnaps. On a fresh install, validation
+          # snapshots are acceptable evidence that snapshotting works until
+          # Sanoid creates its first scheduled autosnap.
+          acceptable_rows="$(printf '%s\n' "$snapshot_rows" | grep -E '@(autosnap_|validation-)' || true)"
+          autosnap_rows="$(printf '%s\n' "$snapshot_rows" | grep -E '@autosnap_' || true)"
+          validation_rows="$(printf '%s\n' "$snapshot_rows" | grep -E '@validation-' || true)"
+
+          if [ -z "$acceptable_rows" ]; then
+            echo "FAIL: snapshots exist, but none match autosnap_* or validation-* naming"
+            exit 1
+          fi
+
+          if [ -n "$autosnap_rows" ]; then
+            selected_rows="$autosnap_rows"
+            echo "Using newest Sanoid autosnap for freshness decision."
+          else
+            selected_rows="$validation_rows"
+            echo "WARN: no Sanoid autosnap found yet; using newest validation snapshot."
+            echo "This is acceptable on a fresh install, but Sanoid should create autosnap_* snapshots over time."
+          fi
+
+          latest_line="$(printf '%s\n' "$selected_rows" | tail -1)"
+          latest_name="$(printf '%s\n' "$latest_line" | awk '{print $1}')"
+          latest_creation="$(printf '%s\n' "$latest_line" | cut -d' ' -f2-)"
+
+          latest_epoch="$(date -d "$latest_creation" +%s)"
+          now_epoch="$(date +%s)"
+          age_seconds="$((now_epoch - latest_epoch))"
+          max_seconds="$((MAX_AGE_HOURS * 3600))"
+
+          echo "Newest acceptable snapshot: $latest_name"
+          echo "Newest acceptable snapshot age: $((age_seconds / 3600)) hours"
+
+          if [ "$age_seconds" -le "$max_seconds" ]; then
+            echo "SANOID FRESHNESS CHECK PASSED"
+            exit 0
+          else
+            echo "FAIL: newest acceptable snapshot is older than expected"
+            exit 1
+          fi
+
+      - path: /etc/systemd/system/check-sanoid-freshness.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Check Sanoid Snapshot Freshness
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/check-sanoid-freshness
+
+      - path: /etc/systemd/system/check-sanoid-freshness.timer
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Daily Sanoid Snapshot Freshness Check
+
+          [Timer]
+          OnCalendar=daily
+          Persistent=true
+          RandomizedDelaySec=1h
+
+          [Install]
+          WantedBy=timers.target
+
+      # ZFS capacity check.
+      #
+      # ZFS pools should not be allowed to run too full. Performance and
+      # reliability degrade as pools approach capacity. This check warns/fails
+      # before that happens.
+      - path: /usr/local/sbin/check-zfs-capacity
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          WARN_PERCENT="${WARN_PERCENT:-80}"
+          FAIL_PERCENT="${FAIL_PERCENT:-90}"
+          FAIL=0
+
+          echo "== ZFS capacity check =="
+          echo "Warn threshold: ${WARN_PERCENT}%"
+          echo "Fail threshold: ${FAIL_PERCENT}%"
+
+          zpool list -H -o name,capacity | while read -r pool cap; do
+            pct="${cap%%%}"
+            echo "$pool capacity: $pct%"
+
+            if [ "$pct" -ge "$FAIL_PERCENT" ]; then
+              echo "FAIL: $pool capacity is at or above ${FAIL_PERCENT}%"
+              exit 2
+            elif [ "$pct" -ge "$WARN_PERCENT" ]; then
+              echo "WARN: $pool capacity is at or above ${WARN_PERCENT}%"
+            else
+              echo "PASS: $pool capacity below warning threshold"
+            fi
+          done
+
+      - path: /etc/systemd/system/check-zfs-capacity.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Check ZFS Pool Capacity
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/check-zfs-capacity
+
+      - path: /etc/systemd/system/check-zfs-capacity.timer
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Daily ZFS Pool Capacity Check
+
+          [Timer]
+          OnCalendar=daily
+          Persistent=true
+          RandomizedDelaySec=1h
+
+          [Install]
+          WantedBy=timers.target
+
+
+      # Fast operational health validator.
+      #
+      # This is intended to run frequently, such as daily. It avoids the heavy
+      # restore drill performed by validate-syncvault-all and focuses on fast
+      # checks that catch common operational failures:
+      #
+      # - network security posture
+      # - ZFS scrub scheduling
+      # - ZFS pool health
+      # - ZFS capacity
+      # - Sanoid snapshot freshness
+      # - local Restic repository metadata health
+      #
+      # This is the validator that should be used for routine daily health.
+      - path: /usr/local/sbin/validate-syncvault-health
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          FAIL=0
+
+          run_check() {
+            name="$1"
+            shift
+
+            echo
+            echo "################################################################"
+            echo "== $name =="
+            echo "################################################################"
+
+            if "$@"; then
+              echo "PASS: $name"
+            else
+              echo "FAIL: $name"
+              FAIL=1
+            fi
+          }
+
+          run_check "network security" /usr/local/sbin/validate-network-security
+          run_check "ZFS scrub scheduling" /usr/local/sbin/validate-zfs-scrubs
+          run_check "ZFS health" /usr/local/sbin/check-zfs-health
+          run_check "ZFS capacity" /usr/local/sbin/check-zfs-capacity
+          run_check "Sanoid freshness" /usr/local/sbin/check-sanoid-freshness
+          run_check "local Restic repository" /usr/local/sbin/check-restic-local
+
+          echo
+          echo "################################################################"
+          echo "== Fast health result =="
+          echo "################################################################"
+
+          if [ "$FAIL" -eq 0 ]; then
+            echo "SYNCVAULT HEALTH VALIDATION PASSED"
+            exit 0
+          else
+            echo "SYNCVAULT HEALTH VALIDATION FAILED"
+            exit 1
+          fi
+
+      - path: /etc/systemd/system/validate-syncvault-health.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Run Fast SyncVault Health Validation
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/validate-syncvault-health
+
+      - path: /etc/systemd/system/validate-syncvault-health.timer
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Daily Fast SyncVault Health Validation
+
+          [Timer]
+          OnCalendar=daily
+          Persistent=true
+          RandomizedDelaySec=2h
+
+          [Install]
+          WantedBy=timers.target
+
+
+      # Deep aggregate maintenance validator.
+      #
+      # This is the comprehensive recovery-drill validator. It includes all
+      # fast health checks plus a real local backup and restore validation.
+      #
+      # This can be IO-heavy because it restores the latest Restic snapshot.
+      # Use validate-syncvault-health for daily health checks and use this
+      # command weekly, monthly, after major changes, or before a release.
+      #
+      # B2 validation is intentionally not included because B2 may not be
+      # configured on every deployment.
+      - path: /usr/local/sbin/validate-syncvault-all
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          FAIL=0
+
+          run_check() {
+            name="$1"
+            shift
+
+            echo
+            echo "################################################################"
+            echo "== $name =="
+            echo "################################################################"
+
+            if "$@"; then
+              echo "PASS: $name"
+            else
+              echo "FAIL: $name"
+              FAIL=1
+            fi
+          }
+
+          run_check "network security" /usr/local/sbin/validate-network-security
+          run_check "ZFS scrub scheduling" /usr/local/sbin/validate-zfs-scrubs
+          run_check "ZFS health" /usr/local/sbin/check-zfs-health
+          run_check "ZFS capacity" /usr/local/sbin/check-zfs-capacity
+          run_check "Sanoid freshness" /usr/local/sbin/check-sanoid-freshness
+          run_check "local Restic repository" /usr/local/sbin/check-restic-local
+          run_check "local backup and restore" /usr/local/sbin/validate-syncvault
+
+          echo
+          echo "################################################################"
+          echo "== Aggregate result =="
+          echo "################################################################"
+
+          if [ "$FAIL" -eq 0 ]; then
+            echo "SYNCVAULT ALL VALIDATION PASSED"
+            exit 0
+          else
+            echo "SYNCVAULT ALL VALIDATION FAILED"
+            exit 1
+          fi
+
+      - path: /etc/systemd/system/validate-syncvault-all.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Run Aggregate SyncVault Validation
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/validate-syncvault-all
+
+      - path: /etc/systemd/system/validate-syncvault-all.timer
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Weekly Aggregate SyncVault Validation
+
+          [Timer]
+          OnCalendar=Sun 05:30
+          Persistent=true
+          RandomizedDelaySec=2h
+
+          [Install]
+          WantedBy=timers.target
+
+
+      # Explicit deep validation alias.
+      #
+      # validate-syncvault-all is kept for compatibility. This alias makes the
+      # intended operational meaning clear in docs and command history.
+      - path: /usr/local/sbin/validate-syncvault-deep
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec /usr/local/sbin/validate-syncvault-all "$@"
+
+
+    runcmd:
+      # Create dedicated ZFS dataset for Syncthing.
+      #
+      # Ubuntu's ZFS autoinstall layout normally creates a pool named rpool.
+      # The sync dataset is isolated so it can have its own snapshots,
+      # retention policy, and backup behavior.
+      - zfs list rpool/sync >/dev/null 2>&1 || zfs create -o compression=zstd -o atime=off -o xattr=sa -o acltype=posixacl -o recordsize=1M -o mountpoint=/srv/syncthing rpool/sync
+
+      # Create dedicated ZFS dataset for local Restic repository.
+      #
+      # This keeps the local backup repository separate from the live sync
+      # dataset and avoids backing the Restic repository into itself.
+      - zfs list rpool/restic >/dev/null 2>&1 || zfs create -o compression=zstd -o atime=off -o mountpoint=/srv/restic rpool/restic
+
+      # Dataset ownership and permissions.
+      - mkdir -p /srv/syncthing/sync
+      - chown -R redacted:redacted /srv/syncthing
+      - chmod 0750 /srv/syncthing
+      - mkdir -p /srv/restic
+      - chown root:root /srv/restic
+      - chmod 0700 /srv/restic
+
+      # SSH hardening.
+      #
+      # Ubuntu packaging may expose either ssh or sshd unit names depending on
+      # version/socket activation behavior, so tolerate either.
+      - systemctl restart ssh || systemctl restart sshd || true
+
+      # UFW firewall.
+      #
+      # OpenSSH is allowed for administration.
+      # Syncthing listens on 22000/tcp and 22000/udp.
+      # Syncthing local discovery uses 21027/udp.
+      - ufw default deny incoming
+      - ufw default allow outgoing
+      - ufw allow OpenSSH
+      - ufw allow 22000/tcp
+      - ufw allow 22000/udp
+      - ufw allow 21027/udp
+      - ufw --force enable
+
+      # Fail2ban.
+      - systemctl enable --now fail2ban
+
+      # Syncthing.
+      #
+      # The STNODEFAULTFOLDER override is written above. The service is enabled
+      # for the operator user and uses /srv/syncthing/sync as the intended
+      # folder root.
+      - mkdir -p /etc/systemd/system/syncthing@redacted.service.d
+      - systemctl daemon-reload
+      - systemctl enable --now syncthing@redacted
+
+      # Sanoid snapshots for rpool/sync.
+      - systemctl enable --now sanoid.timer || true
+
+      # Initialize local Restic repo if needed.
+      - /bin/sh -c '. /etc/restic/local.env && restic snapshots >/dev/null 2>&1 || restic init'
+
+      # Restic local daily backup timer.
+      - systemctl enable --now restic-backup-local.timer
+
+
+      # ZFS scrub timers.
+      #
+      # Scrubs are scheduled monthly with a randomized delay. This catches
+      # latent corruption and verifies pool readability over time.
+      - systemctl daemon-reload
+      - systemctl enable --now zfs-scrub-rpool.timer
+      - systemctl enable --now zfs-scrub-bpool.timer || true
+
+
+      # Automated maintenance health checks.
+      #
+      # These timers make validation routine instead of purely manual. They do
+      # not replace external alerting, but they provide a solid local
+      # maintenance baseline and useful logs through systemd/journalctl.
+      - systemctl enable --now check-restic-local.timer
+      - systemctl enable --now check-zfs-health.timer
+      - systemctl enable --now check-sanoid-freshness.timer
+      - systemctl enable --now check-zfs-capacity.timer
+      - systemctl enable --now validate-syncvault-health.timer
+      - systemctl enable --now validate-syncvault-all.timer
+
+      # B2 auto-enable behavior.
+      #
+      # This keeps the public/source workflow safe while allowing a private
+      # deployable user-data file to enable B2 without manual intervention.
+      #
+      # If /etc/restic/b2.env still contains CHANGE_ME placeholders, B2 is
+      # skipped safely.
+      #
+      # If real B2 credentials are present, enable-restic-b2 initializes the
+      # repository if needed and enables restic-backup-b2.timer.
+      #
+      # Public repo:
+      # - keep placeholders
+      # - B2 will be skipped
+      #
+      # Private deploy repo:
+      # - replace placeholders
+      # - B2 will auto-enable during first boot
+      - /bin/sh -c 'if grep -q CHANGE_ME /etc/restic/b2.env; then echo "B2 placeholders remain; skipping B2 enablement"; else /usr/local/sbin/enable-restic-b2; fi'

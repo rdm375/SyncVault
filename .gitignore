@@ -1,0 +1,89 @@
+# SyncVault .gitignore
+
+# VM disk images
+*.qcow2
+*.qcow
+*.raw
+*.img
+*.vdi
+*.vmdk
+
+# ISO images
+*.iso
+
+# OVMF / UEFI variable stores
+OVMF_VARS*.fd
+*_VARS*.fd
+*.vars.fd
+
+# Cloud-init generated seed images
+seed.iso
+cidata.iso
+*.seed.iso
+
+# Logs
+*.log
+logs/
+*.journal
+
+# Local secrets and environment files
+.env
+*.env
+*.secret
+*.secrets
+secrets/
+private/
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+*.key
+*.pem
+
+# Restic local cache/repositories accidentally copied into repo
+restic/
+.restic/
+restic-cache/
+restore/
+restore-*/
+tmp-restore/
+restic-restore/
+
+# QEMU runtime files
+*.pid
+*.sock
+*.monitor
+*.serial
+
+# Python/editor/cache noise
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Archive outputs
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# Temporary files
+tmp/
+temp/
+.cache/
+
+# Added for v1.0 public release hygiene
+# SyncVault generated/runtime artifacts
+# Logs and temporary output
+# Restic cache/repos/restores accidentally copied into repo
