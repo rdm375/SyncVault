@@ -836,30 +836,6 @@ Avoided intentionally:
 
 ---
 
-# License
-
-MIT License
-
----
-
-# Acknowledgements
-
-Built using:
-
-- Ubuntu
-- cloud-init
-- ZFS
-- Syncthing
-- Restic
-- Sanoid
-- Fail2ban
-- UFW
-- QEMU/KVM
-- Backblaze B2
-
-
----
-
 # Automated Maintenance Health Checks
 
 SyncVault includes scheduled maintenance checks so failures are not discovered only during manual review.
@@ -1134,3 +1110,28 @@ CHANGE_ME_B2_ACCOUNT_KEY
 For a private deployment copy, replace these placeholders before serving `user-data`.
 
 Do not commit real private deployment values to a public repository.
+
+---
+
+# Acknowledgements
+
+Built using:
+
+- Ubuntu
+- cloud-init
+- Syncthing
+- ZFS
+- Sanoid
+- Restic
+- Fail2ban
+- UFW
+- QEMU/KVM
+- Backblaze B2
+
+---
+
+# License
+
+MIT License
+
+---
