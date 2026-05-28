@@ -107,21 +107,6 @@ sudo apt install \
 
 ---
 
-# Pre-flight
-
-## Repository Layout
-
-Example repository contents:
-
-```text
-syncvault/
-├── user-data
-├── meta-data
-├── README.md
-├── docs/
-└── scripts/
-```
-
 # Download Ubuntu Server ISO
 
 Download Ubuntu Server 24.04 LTS into project directory. In your project directory:
@@ -132,6 +117,18 @@ wget https://releases.ubuntu.com/24.04/ubuntu-24.04.3-live-server-amd64.iso
 
 
 ---
+
+# Repository Layout
+
+After downloading the Ubuntu iso your project directory should at least contain the following:
+
+```text
+syncvault/
+├── user-data
+├── meta-data
+└── ubuntu-24.04.3-live-server-amd64.iso
+```
+
 
 # Configure Autoinstall
 
@@ -233,7 +230,7 @@ qemu-system-x86_64 \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
   -drive if=pflash,format=raw,file=OVMF_VARS.fd \
   -drive file=syncvault.qcow2,format=qcow2 \
-  -cdrom ubuntu-24.04-live-server-amd64.iso \
+  -cdrom ubuntu-24.04.3-live-server-amd64.iso \
   -net nic \
   -net user,hostfwd=tcp::2222-:22
 ```
