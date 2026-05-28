@@ -57,9 +57,9 @@ into a single deployable system that can create a fully functional QEMU virtual 
 
 # Why SyncVault Exists
 
-I originally built SyncVault because I wanted a dependable, decentralized way to curate and preserve my phone data.
+I originally built SyncVault because I wanted a dependable, decentralized way to curate and preserve my phone user data.
 
-Syncthing already solved synchronization beautifully, but combining it with ZFS datasets and Sanoid snapshots created a much stronger foundation for recovery and versioned storage.
+Syncthing already solved real-time synchronization beautifully, but combining it with ZFS datasets and Sanoid snapshots created a much stronger foundation for recovery and versioned storage.
 
 Adding Restic enabled encrypted local and offsite backups, while scripted validation and restore testing made it possible to continuously verify the entire recovery chain.
 
@@ -213,7 +213,7 @@ qemu-img create -f qcow2 syncvault.qcow2 64G
 
 ---
 
- # copy over UEFI variables
+# Copy over UEFI variables
 
 ```text
 cp /usr/share/OVMF/OVMF_VARS_4M.fd .
@@ -300,7 +300,7 @@ ssh -p 2222 USER@127.0.0.1
 
 # Verify Cloud-Init
 
-Check installation completion:
+On the VM, check installation completion:
 
 ```bash
 sudo systemctl status cloud-final.service
@@ -338,7 +338,7 @@ Both are acceptable after successful provisioning.
 
 ## Fast Health Validation
 
-Run:
+On the VM, run:
 
 ```bash
 sudo validate-syncvault-health
@@ -363,7 +363,7 @@ SYNCVAULT HEALTH VALIDATION PASSED
 
 # Deep Validation
 
-Run full disaster recovery validation:
+On the VM, run full disaster recovery validation:
 
 ```bash
 sudo validate-syncvault-deep
@@ -386,7 +386,7 @@ SYNCVAULT ALL VALIDATION PASSED
 
 # Verify Scheduled Timers
 
-View validation timers:
+On the VM, view validation timers:
 
 ```bash
 systemctl list-timers 'validate-syncvault-*'
@@ -411,7 +411,7 @@ zfs-scrub-bpool.timer
 
 # Verify Syncthing
 
-Check service:
+On the VM, check service:
 
 ```bash
 systemctl status syncthing@YOUR_USER
@@ -433,13 +433,13 @@ Expected:
 
 # Access Syncthing GUI
 
-Create SSH tunnel:
+On the host, create SSH tunnel:
 
 ```bash
 ssh -L 8386:127.0.0.1:8384 -p 2222 USER@127.0.0.1
 ```
 
-Then open:
+Then on the host, open:
 
 ```text
 http://127.0.0.1:8386
@@ -449,7 +449,7 @@ http://127.0.0.1:8386
 
 # Optional: Configure Backblaze B2
 
-Edit:
+On the VM, edit:
 
 ```text
 /etc/restic/b2.env
@@ -468,7 +468,7 @@ export B2_ACCOUNT_KEY=CHANGE_ME_B2_ACCOUNT_KEY
 
 # Enable B2 Backup
 
-Run:
+On the VM, run:
 
 ```bash
 sudo enable-restic-b2
@@ -478,7 +478,7 @@ sudo enable-restic-b2
 
 # Validate B2
 
-Fast validation:
+On the VM, fast validation:
 
 ```bash
 sudo validate-restic-b2
@@ -527,6 +527,7 @@ After deployment:
 
 ## ZFS Status
 
+On the VM,
 ```bash
 zpool status
 zfs list
@@ -536,6 +537,7 @@ zfs list
 
 ## Force Snapshots
 
+On the VM,
 ```bash
 sudo sanoid --take-snapshots
 ```
@@ -544,6 +546,7 @@ sudo sanoid --take-snapshots
 
 ## View Restic Snapshots
 
+On the VM,
 ```bash
 sudo sh -c '. /etc/restic/local.env && restic snapshots'
 ```
@@ -552,6 +555,7 @@ sudo sh -c '. /etc/restic/local.env && restic snapshots'
 
 ## View Timers
 
+On the VM,
 ```bash
 systemctl list-timers
 ```
@@ -564,8 +568,3 @@ MIT License
 
 
                               ---
-
-
-# License
-
-MIT License
